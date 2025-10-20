@@ -2,25 +2,23 @@ import csv
 import time
 import random
 import sys
-from ipaddress import IPv4Address, IPv4AddressError
+from ipaddress import IPv4Address, AddressValueError 
 from typing import List, Dict, Optional
 
 # Third-party libraries
 try:
     from pyairmore.request import AirmoreSession
     from pyairmore.services.messaging import MessagingService
-    # Importing specific exceptions for better handling
-    from pyairmore.request.exceptions import AuthorizationError, ConnectionError as AirmoreConnectionError
 except ImportError:
     print("Error: Required libraries (pyairmore) are not installed.")
     print("Please run: pip install pyairmore")
     sys.exit(1)
 
-# --- Configuration ---
+# --- Configuration & Defaults ---
 
-# Use constants for fixed data points
-AIRMORE_IP_ADDRESS = "192.168.1.68"
-AIRMORE_PORT = 2333  # Default port
+# Define the default values (can be overridden by user input in main)
+DEFAULT_IP_ADDRESS = "192.168.1.68"
+DEFAULT_PORT = 2333 
 
 # Define the messages as a list of strings for clarity and easy modification
 MESSAGES = [
@@ -29,7 +27,7 @@ MESSAGES = [
 ]
 
 # Random delay range between messages to avoid overwhelming the server/phone
-DELAY_RANGE_SECONDS = (3, 7) # Increased range for more natural spacing
+DELAY_RANGE_SECONDS = (3, 7)
 
 # --- Data Structures and Utilities ---
 
@@ -51,6 +49,7 @@ def validate_and_parse_csv(file_path: str) -> Optional[List[Recipient]]:
     recipients: List[Recipient] = []
     
     try:
+        # Use 'encoding=utf-8' explicitly, which is robust for non-Latin characters
         with open(file_path, 'r', encoding='utf-8') as file:
             csvreader = csv.reader(file)
             next(csvreader)  # Assuming the first row is a header and skipping it
@@ -64,7 +63,7 @@ def validate_and_parse_csv(file_path: str) -> Optional[List[Recipient]]:
                 phone_number = row[2].strip()
                 name = row[0].strip() if row[0] else f"Recipient {i-1}"
                 
-                # Simple check for number length (adjust for your country's format)
+                # Simple check for number length
                 if not phone_number.isdigit() or len(phone_number) < 7:
                     print(f"Warning: Invalid phone number '{phone_number}' in row {i}. Skipping.")
                     continue
@@ -89,12 +88,13 @@ def connect_to_airmore(ip_str: str, port: int) -> Optional[AirmoreSession]:
         ip = IPv4Address(ip_str)
         session = AirmoreSession(ip, port)
         
+        # NOTE: session.is_server_running performs a socket check and doesn't raise a pyairmore exception.
         if not session.is_server_running:
-            print("Error: Airmore server is not running on the specified device/IP.")
+            print("Error: Airmore server is not running or unreachable on the specified device/IP.")
             return None
             
         print("Airmore is running. Requesting authorization on the phone...")
-        was_accepted = session.request_authorization()
+        was_accepted = session.request_authorization() 
         
         if was_accepted:
             print("✅ Authorization accepted! Connection successful.")
@@ -103,11 +103,8 @@ def connect_to_airmore(ip_str: str, port: int) -> Optional[AirmoreSession]:
             print("❌ Authorization was DENIED or TIMED OUT on the phone.")
             return None
             
-    except IPv4AddressError:
+    except AddressValueError:
         print(f"Error: Invalid IP address format: {ip_str}")
-        return None
-    except AirmoreConnectionError:
-        print(f"Error: Could not connect to the device. Check firewall or IP address.")
         return None
     except Exception as e:
         print(f"An unexpected connection error occurred: {e}")
@@ -134,9 +131,12 @@ def send_bulk_messages(session: AirmoreSession, recipients: List[Recipient], mes
         try:
             for i, body in enumerate(messages):
                 print(f"  -> Sending Message {i+1}/{len(messages)}...")
-                service.send_message(recipient.phone_number, body)
                 
-                if i < len(messages) - 1: # Don't sleep after the last message to a recipient
+                # service.send_message calls session.send(), which raises AuthorizationException
+                service.send_message(recipient.phone_number, body) 
+                
+                # Sleep between individual messages within a recipient's sequence
+                if i < len(messages) - 1: 
                     delay = random.randint(*DELAY_RANGE_SECONDS)
                     print(f"  -> Waiting {delay} seconds...")
                     time.sleep(delay)
@@ -144,10 +144,15 @@ def send_bulk_messages(session: AirmoreSession, recipients: List[Recipient], mes
             print("  ✅ All messages sent successfully to this recipient.")
             successful_sends += 1
 
-        except AuthorizationError:
-            print("  ❌ ERROR: Authorization was revoked. Stop sending.")
+        except Exception as e:
+            print(f"  ❌ CRITICAL ERROR: Authorization revoked or expired on the device. Stopping all further sends.")
             failed_sends += (len(recipients) - successful_sends)
             break # Stop the loop on critical authorization failure
+        except ServerUnreachableException as e:
+            # Catching the specific ServerUnreachableException
+            print(f"  ❌ CRITICAL ERROR: Server became unreachable during send. Stopping all further sends. Error: {e}")
+            failed_sends += (len(recipients) - successful_sends)
+            break # Stop the loop on critical failure
         except Exception as e:
             print(f"  ❌ ERROR: Failed to send message(s) to {recipient.phone_number}. Error: {e}")
             failed_sends += 1
@@ -162,16 +167,24 @@ def send_bulk_messages(session: AirmoreSession, recipients: List[Recipient], mes
 # --- Main Execution ---
 
 def main():
-    """The main function controlling the program flow."""
+    """The main function controlling the program flow, now with configurable connection details."""
     print("✨ Professional Airmore Bulk SMS Sender ✨")
     
-    # Get user input for the CSV file path
+    # 1. Get user input for configuration
+    print(f"\n--- Configuration ---")
+    
+    ip_input = input(f"Enter Airmore IP Address (Default: {DEFAULT_IP_ADDRESS}): ").strip()
+    airmore_ip = ip_input if ip_input else DEFAULT_IP_ADDRESS
+
+    port_input = input(f"Enter Airmore Port (Default: {DEFAULT_PORT}): ").strip()
+    airmore_port = int(port_input) if port_input.isdigit() else DEFAULT_PORT
+
     file_path = input("Enter the path to the CSV file (e.g., numbers.csv): ").strip()
     if not file_path:
         print("File path cannot be empty. Exiting.")
         return
 
-    # 1. Parse Data
+    # 2. Parse Data
     recipients = validate_and_parse_csv(file_path)
     if not recipients:
         print("Could not process recipient data. Exiting.")
@@ -179,13 +192,13 @@ def main():
     
     print(f"Loaded {len(recipients)} valid recipients from the CSV.")
 
-    # 2. Connect
-    session = connect_to_airmore(AIRMORE_IP_ADDRESS, AIRMORE_PORT)
+    # 3. Connect
+    session = connect_to_airmore(airmore_ip, airmore_port)
     if not session:
         print("Could not establish a successful Airmore session. Exiting.")
         return
 
-    # 3. Send Messages
+    # 4. Send Messages
     send_bulk_messages(session, recipients, MESSAGES)
     
     print("\nProgram finished.")
